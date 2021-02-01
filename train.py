@@ -19,7 +19,7 @@ import tensorflow as tf
 import core.utils as utils
 from tqdm import tqdm
 from core.dataset import Dataset
-from core.myyolo import YOLOv3
+from core.yolo import YOLOv3
 from core.config import cfg
 from transformers import create_optimizer
 from dataset import get_data, get_dataset_by_iter
