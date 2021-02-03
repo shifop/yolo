@@ -15,6 +15,8 @@ import numpy as np
 import tensorflow as tf
 import core.utils as utils
 from core.config import cfg
+from tensorflow.keras import backend as K
+import math
 
 
 NUM_CLASS       = len(utils.read_class_names(cfg.YOLO.CLASSES))
@@ -23,117 +25,123 @@ STRIDES         = np.array(cfg.YOLO.STRIDES)
 IOU_LOSS_THRESH = cfg.YOLO.IOU_LOSS_THRESH
 
 
-class convolutional(tf.keras.Model):
 
-    def __init__(self, filters_shape, downsample=False, activate=True, bn=True):
-        super(convolutional, self).__init__()
+def Mish(inputs):
+    return inputs * tf.tanh(tf.nn.softplus(inputs))
 
-        self.downsample = downsample
-        self.activate = activate
-        self.bn = bn
-        if downsample:
-            self.padding = tf.keras.layers.ZeroPadding2D(((1, 0), (1, 0)))
-            padding = 'valid'
-            strides = 2
-        else:
-            strides = 1
-            padding = 'same'
-            
-        self.conv = tf.keras.layers.Conv2D(filters=filters_shape[-1], kernel_size = filters_shape[0], strides=strides, padding=padding,
-                                  use_bias=not bn, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
-                                  kernel_initializer=tf.random_normal_initializer(stddev=0.01),
-                                  bias_initializer=tf.constant_initializer(0.))
+class DarknetConv2D_BN_Mish(tf.keras.Model):
 
-        if self.bn:
-            self.bn_ = tf.keras.layers.BatchNormalization()
+    def __init__(self, filters, kernel_size, strides=(1, 1), use_bias=False):
+        super(DarknetConv2D_BN_Mish, self).__init__()
+
+        padding = 'valid' if strides==(2,2) else 'same'
+        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer='l2(5e-4)')
+        self.bn = tf.keras.layers.BatchNormalization()
+        
 
     def __call__(self, input, training):
-        if self.downsample:
-            input = self.padding(input)
-        conv = self.conv(input)
-        if self.bn:
-            conv = self.bn_(conv, training)
-        if self.activate:
-            conv = tf.nn.leaky_relu(conv, alpha=0.1)
-        return conv
+
+        input = self.conv(input)
+        input = self.bn(input,training)
+        input = Mish(input)
+        return input
 
 
-class residual_block(tf.keras.Model):
+class DarknetConv2D_BN_Leaky(tf.keras.Model):
 
-    def __init__(self, input_channel, filter_num1, filter_num2):
-        super(residual_block, self).__init__()
+    def __init__(self, filters, kernel_size, strides=(1, 1), use_bias=False):
+        super(DarknetConv2D_BN_Leaky, self).__init__()
 
-        self.conv1 = convolutional(filters_shape=(1, 1, input_channel, filter_num1))
-        self.conv2 = convolutional(filters_shape=(3, 3, filter_num1,   filter_num2))
+        padding = 'valid' if strides==(2,2) else 'same'
+        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer='l2(5e-4)')
+        self.bn = tf.keras.layers.BatchNormalization()
+        
 
     def __call__(self, input, training):
-        short_cut = input
-        conv = self.conv1(input, training)
-        conv = self.conv2(conv, training)
-        residual_output = short_cut + conv
-        return residual_output
+
+        input = self.conv(input)
+        input = self.bn(input,training)
+        input = tf.nn.leaky_relu(input, alpha=0.1)
+        return input
+
+
+class resblock_body(tf.keras.Model):
+
+    def __init__(self, num_filters, num_blocks, all_narrow=True):
+        super(resblock_body, self).__init__()
+
+        self.num_blocks = num_blocks
+
+        self.padding = tf.keras.layers.ZeroPadding2D(((1,0),(1,0)))
+        self.conv1 = DarknetConv2D_BN_Mish(num_filters, (3,3), strides=(2,2))
+
+        self.conv2 = DarknetConv2D_BN_Mish(num_filters//2 if all_narrow else num_filters, kernel_size = (1,1))
+
+        self.conv3 = DarknetConv2D_BN_Mish(num_filters//2 if all_narrow else num_filters, kernel_size = (1,1))
+
+        self.conv4 = []
+        for i in range(num_blocks):
+            self.conv4.append([DarknetConv2D_BN_Mish(num_filters//2, kernel_size = (1,1)), DarknetConv2D_BN_Mish(num_filters//2 if all_narrow else num_filters, kernel_size = (3,3))])
+
+        self.conv5 = DarknetConv2D_BN_Mish(num_filters//2 if all_narrow else num_filters, kernel_size = (1,1))
+
+        self.conv6 = DarknetConv2D_BN_Mish(num_filters, kernel_size = (1,1))
+
+    def __call__(self, input, training=False):
+        preconv1 = self.padding(input)
+        preconv1 = self.conv1(preconv1, training)
+
+        shortconv = self.conv2(preconv1, training)
+
+        mainconv = self.conv3(preconv1, training)
+
+        for i in range(self.num_blocks):
+            y = self.conv4[i][0](mainconv, training)
+            y = self.conv4[i][1](y, training)
+            mainconv = tf.keras.layers.add([mainconv, y])
+
+        postconv = self.conv5(mainconv, training)
+
+        route = tf.keras.layers.concatenate([postconv, shortconv])
+
+        route = self.conv6(route, training)
+        return route
 
 
 def upsample(input_layer):
     return tf.image.resize(input_layer, (input_layer.shape[1] * 2, input_layer.shape[2] * 2), method='nearest')
 
 
-class darknet53(tf.keras.Model):
+class CSPdarknet53(tf.keras.Model):
 
     def __init__(self):
-        super(darknet53, self).__init__()
+        super(CSPdarknet53, self).__init__()
 
-        self.conv1 = [convolutional((3, 3,  3,  32)), convolutional((3, 3, 32,  64), downsample=True)]
-        self.residual_block1 = [residual_block(64,  32, 64)]
+        self.conv1 = DarknetConv2D_BN_Mish(filters=32, kernel_size=(3,3))
+        self.resblock_body1 = resblock_body(64, 1, False)
+        self.resblock_body2 = resblock_body(128, 2)
+        self.resblock_body3 = resblock_body(256, 8)
+        self.resblock_body4 = resblock_body(512, 8)
+        self.resblock_body5 = resblock_body(1024, 4)
 
-        self.conv2 = [convolutional((3, 3,  64, 128), downsample=True)]
-        self.residual_block2 = [residual_block(128,  64, 128) for _ in range(2)]
-
-        self.conv3 = [convolutional((3, 3, 128, 256), downsample=True)]
-        self.residual_block3 = [residual_block(256, 128, 256) for _ in range(8)]
-
-        self.conv4 = [convolutional((3, 3, 256, 512), downsample=True)]
-        self.residual_block4 = [residual_block(512, 256, 512) for _ in range(8)]
-
-        self.conv5 = [convolutional((3, 3, 512, 1024), downsample=True)]
-        self.residual_block5 = [residual_block(1024, 512, 1024) for _ in range(4)]
 
     def __call__(self, input, training):
-        for m in self.conv1:
-            input = m(input, training)
-        for m in self.residual_block1:
-            input = m(input, training)
+        input = self.conv1(input, training)
+        input = self.resblock_body1(input, training)
+        input = self.resblock_body2(input, training)
+        input = self.resblock_body3(input, training)
+        feat1 = input
+        input = self.resblock_body4(input, training)
+        feat2 = input
+        input = self.resblock_body5(input, training)
+        feat3 = input
 
-        for m in self.conv2:
-            input = m(input, training)
-        for m in self.residual_block2:
-            input = m(input, training)
+        return feat1, feat2, feat3
 
-        for m in self.conv3:
-            input = m(input, training)
-        for m in self.residual_block3:
-            input = m(input, training)
-
-        route_1 = input
-
-        for m in self.conv4:
-            input = m(input, training)
-        for m in self.residual_block4:
-            input = m(input, training)
-
-        route_2 = input
-
-        for m in self.conv5:
-            input = m(input, training)
-        for m in self.residual_block5:
-            input = m(input, training)
-
-        return route_1, route_2, input
-
-class YOLOv3(tf.keras.Model):
+class YOLOv4(tf.keras.Model):
 
     def __init__(self, config):
-        super(YOLOv3, self).__init__()
+        super(YOLOv4, self).__init__()
 
         NUM_CLASS = config['num_class']
         self.NUM_CLASS = NUM_CLASS
@@ -141,45 +149,97 @@ class YOLOv3(tf.keras.Model):
         self.ANCHORS = utils.get_anchors(cfg.YOLO.ANCHORS)
         self.STRIDES = np.array(cfg.YOLO.STRIDES)
 
+        self.padding = tf.keras.layers.ZeroPadding2D(((1,0),(1,0)))
 
-        self.darknet53 = darknet53()
+        self.darknet_body = CSPdarknet53()
 
         self.conv1 = [
-            convolutional((1, 1, 1024,  512)),
-            convolutional((3, 3,  512, 1024)),
-            convolutional((1, 1, 1024,  512)),
-            convolutional((3, 3,  512, 1024)),
-            convolutional((1, 1, 1024,  512))
+            DarknetConv2D_BN_Leaky(512, (1, 1)),
+            DarknetConv2D_BN_Leaky(1024, (3, 3)),
+            DarknetConv2D_BN_Leaky(512, (1, 1))
         ]
 
-        self.conv_lobj_branch1 = convolutional((3, 3, 512, 1024))
-        self.conv_lbbox1 = convolutional((1, 1, 1024, 3*(NUM_CLASS + 5)), activate=False, bn=False)
-
-        self.conv2 = convolutional((1, 1, 512, 256))
-
-        self.conv3 = [
-            convolutional((1, 1, 768, 256)),
-            convolutional((3, 3, 256, 512)),
-            convolutional((1, 1, 512, 256)),
-            convolutional((3, 3, 256, 512)),
-            convolutional((1, 1, 512, 256))
+        self.max_pooling1 = [
+            tf.keras.layers.MaxPooling2D(pool_size=(13, 13), strides=(1, 1), padding='same'),
+            tf.keras.layers.MaxPooling2D(pool_size=(9, 9), strides=(1, 1), padding='same'),
+            tf.keras.layers.MaxPooling2D(pool_size=(5, 5), strides=(1, 1), padding='same')
         ]
 
-        self.conv_lobj_branch2 = convolutional((3, 3, 256, 512))
-        self.conv_lbbox2 = convolutional((1, 1, 512, 3*(NUM_CLASS + 5)), activate=False, bn=False)
-
-        self.conv4 = convolutional((1, 1, 256, 128))
-
-        self.conv5 = [
-            convolutional((1, 1, 384, 128)),
-            convolutional((3, 3, 128, 256)),
-            convolutional((1, 1, 256, 128)),
-            convolutional((3, 3, 128, 256)),
-            convolutional((1, 1, 256, 128))
+        self.conv2 = [
+            DarknetConv2D_BN_Leaky(512, (1, 1)),
+            DarknetConv2D_BN_Leaky(1024, (3, 3)),
+            DarknetConv2D_BN_Leaky(512, (1, 1))
         ]
 
-        self.conv_lobj_branch3 = convolutional((3, 3, 128, 256))
-        self.conv_lbbox3 = convolutional((1, 1, 256, 3*(NUM_CLASS +5)), activate=False, bn=False)
+        self.conv_and_unsample1 = [
+            DarknetConv2D_BN_Leaky(256, (1,1)), 
+            tf.keras.layers.UpSampling2D(2)
+        ]
+
+        self.conv3 = DarknetConv2D_BN_Leaky(256, (1,1))
+
+        self.conv4 = [
+            DarknetConv2D_BN_Leaky(256, (1, 1)),
+            DarknetConv2D_BN_Leaky(256*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(256, (1, 1)),
+            DarknetConv2D_BN_Leaky(256*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(256, (1, 1))
+        ]
+
+        self.conv_and_unsample2 = [
+            DarknetConv2D_BN_Leaky(128, (1,1)), 
+            tf.keras.layers.UpSampling2D(2)
+        ]
+
+        self.conv5 = DarknetConv2D_BN_Leaky(128, (1,1))
+
+        self.conv6 = [
+            DarknetConv2D_BN_Leaky(128, (1, 1)),
+            DarknetConv2D_BN_Leaky(128*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(128, (1, 1)),
+            DarknetConv2D_BN_Leaky(128*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(128, (1, 1))
+        ]
+
+        """
+        ####################################################################################
+        ###################################第三个特征图######################################
+        ####################################################################################
+        """
+        self.conv7 = DarknetConv2D_BN_Leaky(256, (3,3))
+        self.conv8 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
+        self.conv9 = DarknetConv2D_BN_Leaky(256, (3,3), strides=(2,2))
+        self.conv10 = [
+            DarknetConv2D_BN_Leaky(256, (1, 1)),
+            DarknetConv2D_BN_Leaky(256*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(256, (1, 1)),
+            DarknetConv2D_BN_Leaky(256*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(256, (1, 1))
+        ]
+
+        """
+        ####################################################################################
+        ###################################第二个特征图######################################
+        ####################################################################################
+        """
+        self.conv11 = DarknetConv2D_BN_Leaky(512, (3,3))
+        self.conv12 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
+        self.conv13 = DarknetConv2D_BN_Leaky(512, (3,3), strides=(2,2))
+        self.conv14 = [
+            DarknetConv2D_BN_Leaky(512, (1, 1)),
+            DarknetConv2D_BN_Leaky(512*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(512, (1, 1)),
+            DarknetConv2D_BN_Leaky(512*2, (3, 3)),
+            DarknetConv2D_BN_Leaky(512, (1, 1))
+        ]
+
+        """
+        ####################################################################################
+        ###################################第一个特征图######################################
+        ####################################################################################
+        """
+        self.conv15 = DarknetConv2D_BN_Leaky(1024, (3,3))
+        self.conv16 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
 
     def decode(self, conv_output, STRIDES, ANCHORS):
         conv_shape       = tf.shape(conv_output)
@@ -211,36 +271,78 @@ class YOLOv3(tf.keras.Model):
         return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
 
     def __call__(self, input, training):
-        route_1, route_2, conv = self.darknet53(input, training)
+        feat1, feat2, feat3 = self.darknet_body(input, training)
 
-        for m in self.conv1:
-            conv = m(conv, training)
-        conv_lobj_branch1 = self.conv_lobj_branch1(conv, training)
-        conv_lbbox = self.conv_lbbox1(conv_lobj_branch1, training)
-        conv = self.conv2(conv, training)
-        conv = upsample(conv)
-        conv = tf.concat([conv, route_2], axis=-1)
+        P5 = feat3
+        for fn in self.conv1:
+            P5 = fn(P5, training)
 
-        for m in self.conv3:
-            conv = m(conv, training)
-        conv_lobj_branch2 = self.conv_lobj_branch2(conv, training)
-        conv_mbbox = self.conv_lbbox2(conv_lobj_branch2, training)
-        conv = self.conv4(conv, training)
-        conv = upsample(conv)
-        conv = tf.concat([conv, route_1], axis=-1)
+        max_pooling1 = []
+        for fn in self.max_pooling1:
+            max_pooling1.append(fn(P5))
 
-        for m in self.conv5:
-            conv = m(conv, training)
-        conv_lobj_branch3 = self.conv_lobj_branch3(conv, training)
-        conv_sbbox = self.conv_lbbox3(conv_lobj_branch3, training)
+        P5 = tf.keras.layers.concatenate(max_pooling1+[P5])
+        for fn in self.conv2:
+            P5 = fn(P5, training)
+        P5_upsample = self.conv_and_unsample1[0](P5, training)
+        P5_upsample = self.conv_and_unsample1[1](P5_upsample)
+
+        P4 = self.conv3(feat2, training)
+        P4 = tf.keras.layers.concatenate([P4, P5_upsample])
+        for fn in self.conv4:
+            P4 = fn(P4, training)
+        P4_upsample = self.conv_and_unsample2[0](P4, training)
+        P4_upsample = self.conv_and_unsample2[1](P4_upsample)
+
+        P3 = self.conv5(feat1, training)
+        P3 = tf.keras.layers.concatenate([P3, P4_upsample])
+        for fn in self.conv6:
+            P3 = fn(P3, training)
+
+        """
+        ####################################################################################
+        ###################################第三个特征图######################################
+        ####################################################################################
+        """
+        P3_output = self.conv7(P3, training)
+        P3_output = self.conv8(P3_output)
+
+        P3_downsample = self.padding(P3)
+        P3_downsample = self.conv9(P3_downsample, training)
+
+        P4 = tf.keras.layers.concatenate([P3_downsample, P4])
+        for fn in self.conv10:
+            P4 = fn(P4, training)
+
+        """
+        ####################################################################################
+        ###################################第二个特征图######################################
+        ####################################################################################
+        """
+        P4_output = self.conv11(P4, training)
+        P4_output = self.conv12(P4_output)
+
+        P4_downsample = self.padding(P4)
+        P4_downsample = self.conv13(P4_downsample, training)
+
+        P5 = tf.keras.layers.concatenate([P4_downsample, P5])
+        for fn in self.conv14:
+            P5 = fn(P5, training)
+
+        """
+        ####################################################################################
+        ###################################第一个特征图######################################
+        ####################################################################################
+        """
+        P5_output = self.conv15(P5, training)
+        P5_output = self.conv16(P5_output)
 
         # 解码
         output_tensors = []
-        for i, conv_tensor in enumerate([conv_sbbox, conv_mbbox, conv_lbbox]):
+        for i, conv_tensor in enumerate([P3_output, P4_output, P5_output]):
             pred_tensor = self.decode(conv_tensor, self.STRIDES[i], self.ANCHORS[i])
             output_tensors.append(conv_tensor)
             output_tensors.append(pred_tensor)
-
 
         return output_tensors
 
@@ -311,6 +413,58 @@ def bbox_giou(boxes1, boxes2):
     return giou
 
 
+def box_ciou(b1, b2):
+    """
+    输入为：
+    ----------
+    b1: tensor, shape=(batch, feat_w, feat_h, anchor_num, 4), xywh
+    b2: tensor, shape=(batch, feat_w, feat_h, anchor_num, 4), xywh
+    返回为：
+    -------
+    ciou: tensor, shape=(batch, feat_w, feat_h, anchor_num, 1)
+    """
+    # 求出预测框左上角右下角
+    b1_xy = b1[..., :2]
+    b1_wh = b1[..., 2:4]
+    b1_wh_half = b1_wh/2.
+    b1_mins = b1_xy - b1_wh_half
+    b1_maxes = b1_xy + b1_wh_half
+    # 求出真实框左上角右下角
+    b2_xy = b2[..., :2]
+    b2_wh = b2[..., 2:4]
+    b2_wh_half = b2_wh/2.
+    b2_mins = b2_xy - b2_wh_half
+    b2_maxes = b2_xy + b2_wh_half
+
+    # 求真实框和预测框所有的iou
+    intersect_mins = K.maximum(b1_mins, b2_mins)
+    intersect_maxes = K.minimum(b1_maxes, b2_maxes)
+    intersect_wh = K.maximum(intersect_maxes - intersect_mins, 0.)
+    intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
+    b1_area = b1_wh[..., 0] * b1_wh[..., 1]
+    b2_area = b2_wh[..., 0] * b2_wh[..., 1]
+    union_area = b1_area + b2_area - intersect_area
+    iou = intersect_area / K.maximum(union_area,K.epsilon())
+
+    # 计算中心的差距
+    center_distance = K.sum(K.square(b1_xy - b2_xy), axis=-1)
+    # 找到包裹两个框的最小框的左上角和右下角
+    enclose_mins = K.minimum(b1_mins, b2_mins)
+    enclose_maxes = K.maximum(b1_maxes, b2_maxes)
+    enclose_wh = K.maximum(enclose_maxes - enclose_mins, 0.0)
+    # 计算对角线距离
+    enclose_diagonal = K.sum(K.square(enclose_wh), axis=-1)
+    ciou = iou - 1.0 * (center_distance) / K.maximum(enclose_diagonal ,K.epsilon())
+    
+    v = 4*K.square(tf.math.atan2(b1_wh[..., 0], K.maximum(b1_wh[..., 1],K.epsilon())) - tf.math.atan2(b2_wh[..., 0], K.maximum(b2_wh[..., 1],K.epsilon()))) / (math.pi * math.pi)
+    alpha = v /  K.maximum((1.0 - iou + v), K.epsilon())
+    ciou = ciou - alpha * v
+
+    ciou = K.expand_dims(ciou, -1)
+    ciou = tf.where(tf.math.is_nan(ciou), tf.zeros_like(ciou), ciou)
+    return ciou
+
+
 def compute_loss(pred, conv, label, bboxes, i=0):
 
     conv_shape  = tf.shape(conv)
@@ -329,7 +483,8 @@ def compute_loss(pred, conv, label, bboxes, i=0):
     respond_bbox  = label[:, :, :, :, 4:5]
     label_prob    = label[:, :, :, :, 5:]
 
-    giou = tf.expand_dims(bbox_giou(pred_xywh, label_xywh), axis=-1)
+    # giou = tf.expand_dims(box_ciou(pred_xywh, label_xywh), axis=-1)
+    giou = box_ciou(pred_xywh, label_xywh)
     input_size = tf.cast(input_size, tf.float32)
 
     bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_size ** 2)

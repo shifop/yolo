@@ -19,9 +19,10 @@ import tensorflow as tf
 import core.utils as utils
 from tqdm import tqdm
 from core.dataset import Dataset
-from core.yolo import YOLOv3
+from core.yolo import YOLOv4
 from core.config import cfg
 from transformers import create_optimizer
+from util import get_optimization
 from dataset import get_data, get_dataset_by_iter
 import cv2
 from tqdm import tqdm
@@ -31,13 +32,13 @@ import pandas as pd
 import h5py
 
 @tf.function
-def train_step(model, image_data, target, optimizers, index):
+def train_step(model, image_data, target, optimizer, index):
     with tf.GradientTape() as tape:
         giou_loss, conf_loss, prob_loss, total_loss = model.get_loss(image_data, target)
         gradients = tape.gradient(total_loss, model.trainable_variables)
-        optimizers[0].apply_gradients(zip(gradients[:index], model.trainable_variables[:index]))
-        optimizers[1].apply_gradients(zip(gradients[index:], model.trainable_variables[index:]))
-        # optimizers.apply_gradients(zip(gradients, model.trainable_variables))
+        # optimizer[0].apply_gradients(zip(gradients[:index], model.trainable_variables[:index]))
+        # optimizer[1].apply_gradients(zip(gradients[index:], model.trainable_variables[index:]))
+        optimizer.apply_gradients(zip(gradients[index[0]:index[1]], model.trainable_variables[index[0]:index[1]]))
         return giou_loss, conf_loss, prob_loss, total_loss
 
 def dev_step_draw(image_data, target, model, images):
@@ -97,139 +98,11 @@ def load_stock_weights(model, path):
     return model
 
 
-if __name__=='__main__':
-    # 训练、推理模式的选择，0-推理、1-训练
-    tf.keras.backend.set_learning_phase(1)
-    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-    save_f = 'test_ep10_pretrain_aug_random_size'
-    train = Dataset('train')
-    # i2n = ["有框表格","无框表格","页眉","页脚","图片","图表","注脚","公式","目录"]
-    i2n = ["有框表格","无框表格","页眉","图片","图表","公式","目录"]
-
-    size = train.num_batchs
-    train = get_dataset_by_iter(train, cfg.TRAIN.BATCH_SIZE)
-    train_w, init_call = get_data(train, [608, 76, 38, 19])
-
-    test = Dataset('test')
-    dev_size = test.num_batchs
-
-    # 读取标注数据
-    raw_label = {}
-    with open(cfg.TEST.ANNOT_PATH,'r',encoding='utf-8') as f:
-        for line in f:
-            line = line.strip().split(' ')
-            p = line[0]
-            tag = []
-            for _ in line[1:]:
-                tag.append([float(__) for __ in _.split(',')])
-                tag[-1] = tag[-1][:-1]+[1]+tag[-1][-1:]
-            raw_label[p] = tag
-
-    # 获取输入图像的shape
-    n2s = read_json('./data/n2s.json')
-
-    model = YOLOv3({
-        'num_class':9
-    })
-
-    # 打印variable
-    model.get_loss(init_call[0], 
-                ((init_call[1], init_call[4]), 
-                (init_call[2], init_call[5]), 
-                (init_call[3], init_call[6])))
-
-    # for index, x in enumerate(model.variables):
-    #         print('%s %s %s'%(str(index), str(x.name), str(x.shape)))
-
-    optimizer1,_ = create_optimizer(1e-4, cfg.TRAIN.EPOCHS*size, size, 1e-7)
-    optimizer2,_ = create_optimizer(1e-3, cfg.TRAIN.EPOCHS*size, size, 1e-6)
-    optimizer = [optimizer1, optimizer2]
-
-    # EPOCHS = 10000
-    # optimizer1,_ = create_optimizer(1e-3, EPOCHS*size, 1000, 1e-6, weight_decay_rate=0.01)
-    # optimizer2,_ = create_optimizer(1e-4, EPOCHS*size, 1000, 1e-7, weight_decay_rate=0.01)
-    # optimizer = [optimizer1, optimizer2]
-
-    ckpt = tf.train.Checkpoint(model=model)
-    ckpt_manager = tf.train.CheckpointManager(ckpt,
-                                              './model/'+save_f,
-                                              checkpoint_name='model.ckpt',
-                                              max_to_keep=300)
-
-    # ckpt.restore(tf.train.latest_checkpoint('./model/%s/'%(save_f)))
-    load_stock_weights(model,'./checkpoint/tf_model.h5')
-    # ckpt.restore('./model/test_ep5/model.ckpt-400')
-
-
-    images = []
-    img_shape = []
-    with open(cfg.TEST.ANNOT_PATH,'r',encoding='utf-8') as f:
-        for line in f:
-            images.append(line.strip().split(' ')[0])
-            img_shape.append(n2s[images[-1]])
-
+def train_fn(cfg, train_w, test, images, img_shape, optimizer, vindex):
     global_steps = 0
     giou_losses, conf_losses, prob_losses, total_losses = [], [], [], []
     flag = True
 
-
-    ###################################################################################################
-    ###################################################################################################
-    # tqdm_d = tqdm(total=dev_size)
-    # dev_index = 0
-    # dev_batch_size = cfg.TEST.BATCH_SIZE
-    # result = {}
-    # for data_dev in test:
-    #     image_data, target = data_dev
-
-    #     result_ = dev_step(image_data, target, model, images[dev_index*dev_batch_size:(dev_index+1)*dev_batch_size], img_shape[dev_index*dev_batch_size:(dev_index+1)*dev_batch_size])
-    #     dev_index+=1
-    #     tqdm_d.update(1)
-        
-    #     for key in result_:
-    #         if key not in result:
-    #             result[key] = []
-    #         result[key].extend([_.tolist() for _ in result_[key]])
-
-    # tqdm_d.close()
-
-    # # 将分割的图片还原
-    # """
-    # 1. 加上左上点坐标还原到原图的坐标
-    # 2. 再加一次极大值抑制
-    # 3. 连接相邻的boxes
-    # """
-
-    # # 保存为csv格式
-    # # ImageID,LabelName,XMin,XMax,YMin,YMax
-    # with open('./model/%s/dev_%d_label.csv'%(save_f, global_steps),'w',encoding='utf-8') as f:
-    #     f.write('ImageID,LabelName,XMin,YMin,XMax,YMax\n')
-    #     for key in raw_label:
-    #         line = raw_label[key]
-    #         x,y = n2s[key][:2]
-    #         for _ in line:
-    #             f.write('%s,%s,%f,%f,%f,%f\n'%(key, i2n[int(_[-1])], _[0]/y, _[1]/x, _[2]/y, _[3]/x))
-
-
-    # # ImageID,LabelName,Conf,XMin,XMax,YMin,YMax
-    # with open('./model/%s/dev_%d.csv'%(save_f, global_steps),'w',encoding='utf-8') as f:
-    #     f.write('ImageID,LabelName,Conf,XMin,YMin,XMax,YMax\n')
-    #     for key in result:
-    #         line = result[key]
-    #         x,y = n2s[key][:2]
-    #         for _ in line:
-    #             f.write('%s,%s,%f,%f,%f,%f,%f\n'%(key, i2n[int(_[-1])],_[-2], _[0]/y, _[1]/x, _[2]/y, _[3]/x))
-
-    # ann = pd.read_csv('./model/%s/dev_%d_label.csv'%(save_f, global_steps))
-    # det = pd.read_csv('./model/%s/dev_%d.csv'%(save_f, global_steps))
-    # ann = ann[['ImageID', 'LabelName', 'XMin', 'XMax', 'YMin', 'YMax']].values
-    # det = det[['ImageID', 'LabelName', 'Conf', 'XMin', 'XMax', 'YMin', 'YMax']].values
-    # mean_ap, average_precisions = mean_average_precision_for_boxes(ann, det, iou_threshold=0.5)
-    # print('')
-
-    ############################################################################################################################
-    ############################################################################################################################
     for epoch in range(cfg.TRAIN.EPOCHS):
         if not flag:
             break
@@ -237,7 +110,7 @@ if __name__=='__main__':
             image_data = data[0]
             target = ((data[1], data[4]), (data[2], data[5]), (data[3], data[6]))
             
-            giou_loss, conf_loss, prob_loss, total_loss = train_step(model, image_data, target, optimizer, 156)
+            giou_loss, conf_loss, prob_loss, total_loss = train_step(model, image_data, target, optimizer, vindex)
             global_steps+=1
             giou_losses.append(giou_loss)
             conf_losses.append(conf_loss)
@@ -256,9 +129,10 @@ if __name__=='__main__':
 
                 giou_losses, conf_losses, prob_losses, total_losses = [], [], [], []
 
+            if global_steps%1000==0:
                 ckpt_manager.save()
             
-            if global_steps%5000 ==0:
+            if global_steps%1000 ==0:
                 # 跑一次验证集
                 tqdm_d = tqdm(total=dev_size)
                 dev_index = 0
@@ -310,4 +184,79 @@ if __name__=='__main__':
                 ann = ann[['ImageID', 'LabelName', 'XMin', 'XMax', 'YMin', 'YMax']].values
                 det = det[['ImageID', 'LabelName', 'Conf', 'XMin', 'XMax', 'YMin', 'YMax']].values
                 mean_ap, average_precisions = mean_average_precision_for_boxes(ann, det, iou_threshold=0.5)
-                print('')
+
+if __name__=='__main__':
+    # 训练、推理模式的选择，0-推理、1-训练
+    tf.keras.backend.set_learning_phase(1)
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    save_f = 'test_ep10_pretrain_aug_random_size_2'
+    train = Dataset('train')
+    # i2n = ["有框表格","无框表格","页眉","页脚","图片","图表","注脚","公式","目录"]
+    i2n = ["有框表格","无框表格","页眉","图片","图表","公式","目录"]
+
+    size = train.num_batchs
+    train = get_dataset_by_iter(train, cfg.TRAIN.BATCH_SIZE)
+    train_w, init_call = get_data(train, [608, 76, 38, 19])
+
+    test = Dataset('test')
+    dev_size = test.num_batchs
+
+    # 读取标注数据
+    raw_label = {}
+    with open(cfg.TEST.ANNOT_PATH,'r',encoding='utf-8') as f:
+        for line in f:
+            line = line.strip().split(' ')
+            p = line[0]
+            tag = []
+            for _ in line[1:]:
+                tag.append([float(__) for __ in _.split(',')])
+                tag[-1] = tag[-1][:-1]+[1]+tag[-1][-1:]
+            raw_label[p] = tag
+
+    # 获取输入图像的shape
+    n2s = read_json('./data/n2s.json')
+
+    model = YOLOv4({
+        'num_class':len(i2n)
+    })
+
+    # 打印variable
+    model.get_loss(init_call[0], 
+                ((init_call[1], init_call[4]), 
+                (init_call[2], init_call[5]), 
+                (init_call[3], init_call[6])))
+
+    # for index, x in enumerate(model.variables):
+    #         print('%s %s %s'%(str(index), str(x.name), str(x.shape)))
+
+    ckpt = tf.train.Checkpoint(model=model)
+    ckpt_manager = tf.train.CheckpointManager(ckpt,
+                                              './model/'+save_f,
+                                              checkpoint_name='model.ckpt',
+                                              max_to_keep=300)
+
+    ckpt.restore(tf.train.latest_checkpoint('./model/%s/'%('test_ep10_pretrain_aug_random_size')))
+    # load_stock_weights(model,'./checkpoint/tf_model.h5')
+    # ckpt.restore('./model/test_ep5/model.ckpt-400')
+
+
+    images = []
+    img_shape = []
+    with open(cfg.TEST.ANNOT_PATH,'r',encoding='utf-8') as f:
+        for line in f:
+            images.append(line.strip().split(' ')[0])
+            img_shape.append(n2s[images[-1]])
+
+    optimizer1,_ = create_optimizer(5e-5, cfg.TRAIN.EPOCHS*size, size, 1e-3)
+    optimizer2,_ = create_optimizer(5e-4, cfg.TRAIN.EPOCHS*size, size, 1e-3)
+    optimizer = [optimizer1, optimizer2]
+
+    # optimizer1 = get_optimization(5e-5, 5e-8, 5e-8, cfg.TRAIN.EPOCHS*size, int(cfg.TRAIN.EPOCHS*size*0.2), size)
+    # optimizer2 = get_optimization(5e-4, 5e-7, 5e-7, cfg.TRAIN.EPOCHS*size, int(cfg.TRAIN.EPOCHS*size*0.2), size)
+
+    # train_fn(cfg, train_w, test, images, img_shape, optimizer, 216)
+    # tf.print('#'*60+'冻结编码层'+'#'*60)
+    # train_fn(cfg, train_w, test, images, img_shape, optimizer2, [216, len(model.trainable_variables)])
+    tf.print('#'*60+'解冻编码层'+'#'*60)
+    train_fn(cfg, train_w, test, images, img_shape, optimizer1, [0, len(model.trainable_variables)])
