@@ -18,7 +18,7 @@ import numpy as np
 import tensorflow as tf
 import core.utils as utils
 from tqdm import tqdm
-from core.dataset import Dataset
+from core.dataset import Dataset, erode
 from core.yolov3 import YOLOv3
 from core.config import cfg
 from transformers import create_optimizer
@@ -29,6 +29,7 @@ import json
 from map_boxes import mean_average_precision_for_boxes
 import pandas as pd
 import h5py
+import fitz
 
 @tf.function
 def train_step(model, image_data, target, optimizers, index):
@@ -126,6 +127,7 @@ def replace_v(model, n2v):
     
 def pdf_image(pdfPath, imgPath, zoom_x=1.33333333,zoom_y=1.33333333,rotation_angle=0):
     rt = []
+    shape = {}
     if not os.path.exists(imgPath):
         os.mkdir(imgPath)
     # 打开PDF文件
@@ -139,15 +141,39 @@ def pdf_image(pdfPath, imgPath, zoom_x=1.33333333,zoom_y=1.33333333,rotation_ang
         # 开始写图像
         pm.writePNG(imgPath+str(pg)+".png")
         rt.append(imgPath+str(pg)+".png")
+        # 计算预处理后的宽高
+        img = erode(imgPath+str(pg)+".png")
+        shape_ = img.shape
+        # cv2.imwrite(imgPath+str(pg)+".png", img)
+        # shape[imgPath+str(pg)+".png"]=[pm.h,pm.w]
+        shape[imgPath+str(pg)+".png"]=[shape_[0], shape_[1]]
     pdf.close()
-    return rt
+    return rt, shape
     
 def process_pdf(pdf_path,save_path):
-    paths = pdf_image(pdf_path, save_path)
+    paths, shape = pdf_image(pdf_path, save_path)
     # 生成标注数据
     with open(save_path+'info.txt','w',encoding='utf-8') as f:
         for path in paths:
             f.write('%s 114,70,200,94,2\n'%(path))
+
+    with open(save_path+'shape.json','w',encoding='utf-8') as f:
+        f.write(json.dumps(shape, ensure_ascii=False))
+
+def resize(v,v2):
+    if v>=100 and v<250:
+        if v2<250:
+            h = (v2-v)/3
+            v = (v-100)/3+50
+            v2 = v+h
+            return v,v2
+        else:
+            h = (250-v)/3+v2-250
+            v = (v-100)/3+50
+            return v, v+h
+    else:
+        return v-150, v2-150
+
 
 if __name__=='__main__':
     # 训练、推理模式的选择，0-推理、1-训练
@@ -156,15 +182,19 @@ if __name__=='__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     save_f = 'test_ep10_pretrain_aug_clean_not_erode'
     train = Dataset('train')
-    i2n = ["有框表格","无框表格","页眉","图片","图表","公式","目录"]
+    # i2n = ["有框表格","无框表格","页眉","图片","图表","公式","目录"]
+    i2n = ["table","no_line_table","header","image","chart","formular","catalog"]
+
+    pdfname = '紫光股份2019年年度报告.pdf'
+    pdf_path = './predict/%s'%(pdfname)
+    path = './predict/%s/'%(pdfname.split('.')[0])
+    if not os.path.exists(path):
+        os.mkdir(path)
+
+    process_pdf(pdf_path, path)
+    cfg.TEST.ANNOT_PATH = path+'info.txt'
 
     range_ = [185, 226]
-
-    if not os.path.exists('./predict/%d_%d'%(range_[0],range_[1])):
-        os.mkdir('./predict/%d_%d'%(range_[0],range_[1]))
-
-    if not os.path.exists('./predict/%d_%d_v'%(range_[0],range_[1])):
-        os.mkdir('./predict/%d_%d_v'%(range_[0],range_[1]))
 
     size = train.num_batchs
     train = get_dataset_by_iter(train, cfg.TRAIN.BATCH_SIZE)
@@ -186,7 +216,7 @@ if __name__=='__main__':
             raw_label[p] = tag
 
     # 获取输入图像的shape
-    n2s = read_json('./data/n2s.json')
+    n2s = read_json(path+'shape.json')
 
     model = YOLOv3({
         'num_class':len(i2n)
@@ -239,50 +269,13 @@ if __name__=='__main__':
 
     tqdm_d.close()
 
-    # 将分割的图片还原
-    """
-    1. 加上左上点坐标还原到原图的坐标
-    2. 再加一次极大值抑制
-    3. 连接相邻的boxes
-    """
-
-    error_info = read_json('./data/error.json')
-
-    # 保存为csv格式
-    # ImageID,LabelName,XMin,XMax,YMin,YMax
-    with open('./model/%s/dev_%d_label.csv'%(save_f, global_steps),'w',encoding='utf-8') as f:
-        f.write('ImageID,LabelName,XMin,YMin,XMax,YMax\n')
-        for key in raw_label:
-            line = raw_label[key]
-            x,y = n2s[key][:2]
-            if key in error_info:
-                img = cv2.imread(key)
-                img = utils.draw_bbox(img, line)
-                image_name = key.split('/')[-1]
-                cv2.imwrite('./predict/%d_%d_v/%s_.jpg'%(range_[0],range_[1],image_name), img)
-            x,y = n2s[key][:2]
-            for _ in line:
-                f.write('%s,%s,%f,%f,%f,%f\n'%(key, i2n[int(_[-1])], _[0]/y, _[1]/x, _[2]/y, _[3]/x))
-
-    with open('./model/%s/dev_%d.csv'%(save_f, global_steps),'w',encoding='utf-8') as f:
-        f.write('ImageID,LabelName,Conf,XMin,YMin,XMax,YMax\n')
-        for key in result:
-            line = result[key]
-            if key in error_info:
-                img = cv2.imread(key)
-                img = utils.draw_bbox(img, line)
-                image_name = key.split('/')[-1].split('.')[0]
-                cv2.imwrite('./predict/%d_%d/%s.jpg'%(range_[0],range_[1],image_name), img)
-            x,y = n2s[key][:2]
-            for _ in line:
-                f.write('%s,%s,%f,%f,%f,%f,%f\n'%(key, i2n[int(_[-1])],_[-2], _[0]/y, _[1]/x, _[2]/y, _[3]/x))
-
-    ann = pd.read_csv('./model/%s/dev_%d_label.csv'%(save_f, global_steps))
-    det = pd.read_csv('./model/%s/dev_%d.csv'%(save_f, global_steps))
-    ann = ann[['ImageID', 'LabelName', 'XMin', 'XMax', 'YMin', 'YMax']].values
-    det_ = det[['ImageID', 'LabelName', 'Conf', 'XMin', 'XMax', 'YMin', 'YMax']].values
-    mean_ap, average_precisions = mean_average_precision_for_boxes(ann, det_, iou_threshold=0.5)
-
-    det_ = det[det.Conf>=0.5][['ImageID', 'LabelName', 'Conf', 'XMin', 'XMax', 'YMin', 'YMax']].values
-    mean_ap, average_precisions = mean_average_precision_for_boxes(ann, det_, iou_threshold=0.5)
-
+    for key in result:
+        line = result[key]
+        for _ in range(len(line)):
+            offset = resize(line[_][1], line[_][3])
+            line[_][1] = offset[0]
+            line[_][3] = offset[1]
+        img = cv2.imread(key)
+        img = utils.draw_bbox(img, line)
+        image_name = key.split('/')[-1].split('.')[0]
+        cv2.imwrite('./predict/%s/%s_p.png'%(pdfname.split('.')[0],image_name), img)

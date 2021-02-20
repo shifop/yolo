@@ -17,6 +17,8 @@ import core.utils as utils
 from core.config import cfg
 from tensorflow.keras import backend as K
 import math
+from core.dropblock import DropBlock
+# from core.yolov3 import darknet53
 
 
 NUM_CLASS       = len(utils.read_class_names(cfg.YOLO.CLASSES))
@@ -35,7 +37,7 @@ class DarknetConv2D_BN_Mish(tf.keras.Model):
         super(DarknetConv2D_BN_Mish, self).__init__()
 
         padding = 'valid' if strides==(2,2) else 'same'
-        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer='l2(5e-4)')
+        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer=tf.keras.regularizers.l2(0.0005), kernel_initializer=tf.keras.initializers.glorot_normal())
         self.bn = tf.keras.layers.BatchNormalization()
         
 
@@ -53,7 +55,7 @@ class DarknetConv2D_BN_Leaky(tf.keras.Model):
         super(DarknetConv2D_BN_Leaky, self).__init__()
 
         padding = 'valid' if strides==(2,2) else 'same'
-        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer='l2(5e-4)')
+        self.conv = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, strides=strides, use_bias=use_bias, padding=padding, kernel_regularizer=tf.keras.regularizers.l2(0.0005), kernel_initializer=tf.keras.initializers.glorot_normal())
         self.bn = tf.keras.layers.BatchNormalization()
         
 
@@ -61,7 +63,9 @@ class DarknetConv2D_BN_Leaky(tf.keras.Model):
 
         input = self.conv(input)
         input = self.bn(input,training)
-        input = tf.nn.leaky_relu(input, alpha=0.1)
+        input = tf.nn.leaky_relu(input)
+        # input = tf.nn.leaky_relu(input, alpha=0.1)
+        # input = Mish(input)
         return input
 
 
@@ -152,6 +156,11 @@ class YOLOv4(tf.keras.Model):
         self.padding = tf.keras.layers.ZeroPadding2D(((1,0),(1,0)))
 
         self.darknet_body = CSPdarknet53()
+        # self.darknet_body = darknet53()
+
+        self.dropblock1 = DropBlock(0.9,9)
+        self.dropblock2 = DropBlock(0.9,6)
+        self.dropblock3 = DropBlock(0.9,3)
 
         self.conv1 = [
             DarknetConv2D_BN_Leaky(512, (1, 1)),
@@ -207,7 +216,9 @@ class YOLOv4(tf.keras.Model):
         ####################################################################################
         """
         self.conv7 = DarknetConv2D_BN_Leaky(256, (3,3))
-        self.conv8 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
+        self.conv8 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same', use_bias=True, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
+                                  kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+                                  bias_initializer=tf.constant_initializer(0.))
         self.conv9 = DarknetConv2D_BN_Leaky(256, (3,3), strides=(2,2))
         self.conv10 = [
             DarknetConv2D_BN_Leaky(256, (1, 1)),
@@ -223,7 +234,9 @@ class YOLOv4(tf.keras.Model):
         ####################################################################################
         """
         self.conv11 = DarknetConv2D_BN_Leaky(512, (3,3))
-        self.conv12 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
+        self.conv12 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same', use_bias=True, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
+                                  kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+                                  bias_initializer=tf.constant_initializer(0.))
         self.conv13 = DarknetConv2D_BN_Leaky(512, (3,3), strides=(2,2))
         self.conv14 = [
             DarknetConv2D_BN_Leaky(512, (1, 1)),
@@ -239,7 +252,9 @@ class YOLOv4(tf.keras.Model):
         ####################################################################################
         """
         self.conv15 = DarknetConv2D_BN_Leaky(1024, (3,3))
-        self.conv16 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same')
+        self.conv16 = tf.keras.layers.Conv2D(len(self.ANCHORS)*(self.NUM_CLASS+5), (1,1), padding='same', use_bias=True, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
+                                  kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+                                  bias_initializer=tf.constant_initializer(0.))
 
     def decode(self, conv_output, STRIDES, ANCHORS):
         conv_shape       = tf.shape(conv_output)
@@ -272,6 +287,10 @@ class YOLOv4(tf.keras.Model):
 
     def __call__(self, input, training):
         feat1, feat2, feat3 = self.darknet_body(input, training)
+
+        feat1 = self.dropblock1(feat1, training=training)
+        feat2 = self.dropblock2(feat2, training=training)
+        feat3 = self.dropblock3(feat3, training=training)
 
         P5 = feat3
         for fn in self.conv1:
@@ -505,6 +524,8 @@ def compute_loss(pred, conv, label, bboxes, i=0):
 
     prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob, logits=conv_raw_prob)
 
+    # conf_loss = tf.where(tf.math.is_nan(conf_loss), tf.zeros_like(conf_loss), conf_loss)
+    # prob_loss = tf.where(tf.math.is_nan(prob_loss), tf.zeros_like(prob_loss), prob_loss)
     giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1,2,3,4]))
     conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1,2,3,4]))
     prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1,2,3,4]))

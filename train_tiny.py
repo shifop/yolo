@@ -19,7 +19,7 @@ import tensorflow as tf
 import core.utils as utils
 from tqdm import tqdm
 from core.dataset import Dataset
-from core.yolov3 import YOLOv3
+from core.yolov3_tiny import YOLOv3
 from core.config import cfg
 from transformers import create_optimizer
 from util import get_optimization
@@ -36,9 +36,9 @@ def train_step(model, image_data, target, optimizer, index):
     with tf.GradientTape() as tape:
         giou_loss, conf_loss, prob_loss, total_loss = model.get_loss(image_data, target)
         gradients = tape.gradient(total_loss, model.trainable_variables)
-        optimizer[0].apply_gradients(zip(gradients[:index], model.trainable_variables[:index]))
-        optimizer[1].apply_gradients(zip(gradients[index:], model.trainable_variables[index:]))
-        # optimizer.apply_gradients(zip(gradients[index[0]:index[1]], model.trainable_variables[index[0]:index[1]]))
+        # optimizer[0].apply_gradients(zip(gradients[:index], model.trainable_variables[:index]))
+        # optimizer[1].apply_gradients(zip(gradients[index:], model.trainable_variables[index:]))
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         return giou_loss, conf_loss, prob_loss, total_loss
 
 def dev_step_draw(image_data, target, model, images):
@@ -190,7 +190,7 @@ if __name__=='__main__':
     tf.keras.backend.set_learning_phase(1)
     os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-    save_f = 'test_ep10_pretrain_aug_clean_not_erode'
+    save_f = 'test_ep10_tiny'
     train = Dataset('train')
     # i2n = ["有框表格","无框表格","页眉","页脚","图片","图表","注脚","公式","目录"]
     i2n = ["有框表格","无框表格","页眉","图片","图表","公式","目录"]
@@ -227,8 +227,8 @@ if __name__=='__main__':
                 (init_call[2], init_call[5]), 
                 (init_call[3], init_call[6])))
 
-    # for index, x in enumerate(model.variables):
-    #         print('%s %s %s'%(str(index), str(x.name), str(x.shape)))
+    for index, x in enumerate(model.trainable_variables):
+            print('%s %s %s'%(str(index), str(x.name), str(x.shape)))
 
     ckpt = tf.train.Checkpoint(model=model)
     ckpt_manager = tf.train.CheckpointManager(ckpt,
@@ -237,7 +237,7 @@ if __name__=='__main__':
                                               max_to_keep=300)
 
     # ckpt.restore(tf.train.latest_checkpoint('./model/%s/'%('test_ep10_pretrain_aug_random_size')))
-    load_stock_weights(model,'./checkpoint/tf_model_v3.h5')
+    # load_stock_weights(model,'./checkpoint/tf_model_v3.h5')
     # ckpt.restore('./model/test_ep5/model.ckpt-400')
 
 
@@ -248,14 +248,14 @@ if __name__=='__main__':
             images.append(line.strip().split(' ')[0])
             img_shape.append(n2s[images[-1]])
 
-    optimizer1,_ = create_optimizer(1e-4, cfg.TRAIN.EPOCHS*size, size, 1e-3, weight_decay_rate=0.01)
+    # optimizer1,_ = create_optimizer(1e-4, cfg.TRAIN.EPOCHS*size, size, 1e-3, weight_decay_rate=0.01)
     optimizer2,_ = create_optimizer(1e-3, cfg.TRAIN.EPOCHS*size, size, 1e-3, weight_decay_rate=0.01)
-    optimizer = [optimizer1, optimizer2]
+    # optimizer = [optimizer1, optimizer2]
 
     # optimizer1 = get_optimization(5e-5, 5e-8, 5e-8, cfg.TRAIN.EPOCHS*size, int(cfg.TRAIN.EPOCHS*size*0.2), size)
     # optimizer2 = get_optimization(1e-3, 1e-6, 1e-6, cfg.TRAIN.EPOCHS*size, int(cfg.TRAIN.EPOCHS*size*0.2), size)
 
-    train_fn(cfg, train_w, test, images, img_shape, optimizer, 156)
+    train_fn(cfg, train_w, test, images, img_shape, optimizer2, 156)
     # tf.print('#'*60+'冻结编码层'+'#'*60)
     # train_fn(cfg, train_w, test, images, img_shape, optimizer2, [216, len(model.trainable_variables)])
     # tf.print('#'*60+'解冻编码层'+'#'*60)

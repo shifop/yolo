@@ -20,7 +20,7 @@ import core.utils as utils
 from core.config import cfg
 
 
-def erode(img_path):
+def erode(img_path, y_small=50, y_large=100, pad=50, times=3):
     """
     对传入的图像列表做预处理，包括侵蚀、拉长和padding，再存入当前文件夹的一个临时文件夹。这个文件夹后面由别的函数来删除。
     args:
@@ -33,6 +33,14 @@ def erode(img_path):
     # erode
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     img = cv2.erode(img,kernel)
+    # elongate
+    part1 = img[:y_small]
+    part2 = img[y_small: y_large]
+    part3 = img[y_large:]
+    part2_new = cv2.resize(part2, None, fx=1,fy = times)
+    img = np.concatenate((part1, part2_new, part3), axis = 0)
+    # pad
+    img = cv2.copyMakeBorder(img, pad, 0, 0, 0, cv2.BORDER_REPLICATE)
     return img
 
 
@@ -71,9 +79,7 @@ class Dataset(object):
             set3 = [] # 页眉页脚以及其他
             for _ in annotations:
                 _c = [int(__[-1]) for __ in _.split(' ')[1:]]
-                if (2 in _c or 3 in _c) and len(_c)<2:
-                    set1.append(_)
-                elif 2 in _c and 3 in _c and len(_c)<=2:
+                if 2 in _c and len(_c)<2:
                     set1.append(_)
                 elif 5 in _c or 6 in _c or 7 in _c or 8 in _c:
                     set3.append(_)
@@ -195,8 +201,8 @@ class Dataset(object):
         image_path = line[0]
         if not os.path.exists(image_path):
             raise KeyError("%s does not exist ... " %image_path)
-        # image = cv2.imread(image_path)
-        image = erode(image_path)
+        image = cv2.imread(image_path)
+        # image = erode(image_path)
         bboxes = np.array([list(map(int, box.split(','))) for box in line[1:]])
 
         if self.data_aug:
